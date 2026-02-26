@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+import yaml
+import argparse
+import numpy as np
+import time
+from python_tsp.heuristics import solve_tsp_local_search
+
+# ---------------------------------------------------------
+# 1. 这里放入我们刚才写的三个数学函数
+# ---------------------------------------------------------
+def extract_bounds(obstacles_dict):
+    bounds = []
+    if not obstacles_dict: return bounds
+    for obs_id, obs in obstacles_dict.items():
+        half_w, half_d, half_h = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
+        min_bound = np.array([obs['x'] - half_w, obs['y'] - half_d, obs['z'] - half_h]) - 0.3
+        max_bound = np.array([obs['x'] + half_w, obs['y'] + half_d, obs['z'] + half_h]) + 0.3
+        bounds.append((min_bound, max_bound))
+    return bounds
+
+def check_collision(p1, p2, obstacle_bounds, num_samples=50):
+    if not obstacle_bounds: return False
+    t = np.linspace(0, 1, num_samples)[:, np.newaxis] 
+    segment_points = p1 + t * (p2 - p1)
+    for min_b, max_b in obstacle_bounds:
+        inside_x = (segment_points[:, 0] >= min_b[0]) & (segment_points[:, 0] <= max_b[0])
+        inside_y = (segment_points[:, 1] >= min_b[1]) & (segment_points[:, 1] <= max_b[1])
+        inside_z = (segment_points[:, 2] >= min_b[2]) & (segment_points[:, 2] <= max_b[2])
+        if np.any(inside_x & inside_y & inside_z): return True 
+    return False
+
+def build_cost_matrix(scenario_data):
+    points = []
+    start_pose = scenario_data['drone_start_pose']
+    points.append([start_pose['x'], start_pose['y'], start_pose['z']])
+    
+    vp_poses = scenario_data['viewpoint_poses']
+    # 记录原始的 ID 映射，因为 TSP 库只认识 0,1,2,3...
+    vp_ids = sorted(vp_poses.keys()) 
+    
+    for vp_id in vp_ids:
+        vp = vp_poses[vp_id]
+        points.append([vp['x'], vp['y'], vp['z']])
+        
+    points_array = np.array(points)
+    N = len(points_array)
+    obstacle_bounds = extract_bounds(scenario_data.get('obstacles', {}))
+    
+    cost_matrix = np.zeros((N, N))
+    for i in range(N):
+        for j in range(N):
+            if i == j: continue
+            dist = np.linalg.norm(points_array[i] - points_array[j])
+            if check_collision(points_array[i], points_array[j], obstacle_bounds):
+                cost_matrix[i][j] = dist * 100.0  # 穿墙惩罚
+            else:
+                cost_matrix[i][j] = dist
+    return cost_matrix, vp_ids
+
+# ---------------------------------------------------------
+# 2. 独立的命令行测试入口
+# ---------------------------------------------------------
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Test TSP Algorithm independently')
+    parser.add_argument('-s', '--scenario', type=str, required=True, help="path to scenario yaml")
+    args = parser.parse_args()
+
+    print(f"[TEST] Reading scenario from: {args.scenario}")
+    with open(args.scenario, 'r') as file:
+        scenario = yaml.safe_load(file)
+
+    print("[TEST] Building Cost Matrix...")
+    start_time = time.time()
+    matrix, original_vp_ids = build_cost_matrix(scenario)
+    matrix_time = time.time() - start_time
+    
+    print(f"[TEST] Matrix built in {matrix_time:.4f} seconds. Shape: {matrix.shape}")
+    
+    print("[TEST] Running TSP Solver...")
+    tsp_start = time.time()
+    # 调用 python_tsp 的启发式算法
+    route_indices, total_cost = solve_tsp_local_search(matrix)
+    tsp_time = time.time() - tsp_start
+    
+    # 翻译结果：由于节点 0 是起点，后续的节点 1, 2, 3 需要映射回原始的 vp_id
+    optimized_vpids = []
+    for idx in route_indices:
+        if idx == 0:
+            optimized_vpids.append("START")
+        else:
+            optimized_vpids.append(original_vp_ids[idx - 1])
+
+    print(f"--------------------------------------------------")
+    print(f"✅ Algorithm Test Passed!")
+    print(f"Total Computation Time: {matrix_time + tsp_time:.4f} s")
+    print(f"Estimated Trajectory Cost: {total_cost:.2f}")
+    print(f"Optimized Visit Order: {' -> '.join(str(x) for x in optimized_vpids)}")
+    print(f"--------------------------------------------------")
