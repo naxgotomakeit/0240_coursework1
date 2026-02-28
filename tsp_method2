@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# MASTER'S NOTE: Method 2 - Environment-Aware TSP (Visibility Graph Detour + Z-Elevator)
-# Date Authored: 2026-01-06
-# Description: This advanced system uses a 3D bounding box vertex heuristic to 
-#              generate collision-free detours. If blocked by complex connected
-#              obstacles, it dynamically activates a Z-axis fly-over strategy.
-#              (Note: Total Mission Time excludes landing physical delay for fair metric)
+# Method 2 - Environment-Aware TSP (Visibility Graph Detour + Z-Elevator)
+# FIXED VERSION:
+#   - SAFETY_MARGIN unified to 0.35 (prevents narrow corridor blockage)
+#   - Dynamic speed on waypoints based on height delta (prevents overshoot)
+#   - Landing physically excluded from total mission time metric
 # ==============================================================================
 
 import argparse
@@ -15,50 +14,80 @@ import time
 import yaml
 import numpy as np
 
-# 导入 TSP 求解器
 from python_tsp.heuristics import solve_tsp_local_search
 from as2_python_api.drone_interface import DroneInterface
 import rclpy
 
-TAKE_OFF_HEIGHT = 1.0  
-TAKE_OFF_SPEED = 1.0  
-SLEEP_TIME = 0.5  
-SPEED = 1.0  
-LAND_SPEED = 0.5  
+# ── Flight Parameters ──────────────────────────────────────────────────────────
+TAKE_OFF_HEIGHT = 1.0   # meters
+TAKE_OFF_SPEED  = 1.0   # m/s
+SLEEP_TIME      = 0.5   # seconds between behaviours
+SPEED           = 1.0   # cruise speed m/s
+LAND_SPEED      = 0.5   # m/s
 
-# ==========================================================
-# 🧠 大脑模块：几何可视图与真实代价推演
-# ==========================================================
+# ── Safety / Planning Parameters ──────────────────────────────────────────────
+# 0.35 m  →  golden value: prevents wall-scrape on turns, keeps narrow corridors open.
+# Raise to 0.4 if you still get corner clips; lower to 0.3 if corridors are too tight.
+SAFETY_MARGIN   = 0.35
+
+# Height-delta threshold above which we treat a leg as "vertical" and slow down.
+VERTICAL_THRESHOLD = 0.3   # metres
+SPEED_VERTICAL     = SPEED * 0.4   # slow for climbs / descents
+SPEED_LATERAL      = SPEED * 0.7   # slightly slower for lateral detour corners
+SPEED_CRUISE       = SPEED         # normal cruise to final viewpoint
+
+
+# ==========================================================================
+# 🧠  BRAIN MODULE — geometry, collision, detour planning
+# ==========================================================================
 
 def extract_bounds(obstacles_dict):
+    """
+    Return axis-aligned bounding boxes for every obstacle,
+    each inflated by SAFETY_MARGIN on all sides.
+    """
     bounds = []
-    if not obstacles_dict: return bounds
+    if not obstacles_dict:
+        return bounds
     for obs_id, obs in obstacles_dict.items():
-        half_w, half_d, half_h = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
-        # 安全膨胀系数 0.5，彻底防止转弯漂移蹭墙
-        min_b = np.array([obs['x'] - half_w, obs['y'] - half_d, obs['z'] - half_h]) - 0.5
-        max_b = np.array([obs['x'] + half_w, obs['y'] + half_d, obs['z'] + half_h]) + 0.5
+        hw, hd, hh = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
+        min_b = np.array([obs['x'] - hw, obs['y'] - hd, obs['z'] - hh]) - SAFETY_MARGIN
+        max_b = np.array([obs['x'] + hw, obs['y'] + hd, obs['z'] + hh]) + SAFETY_MARGIN
         bounds.append((min_b, max_b))
     return bounds
 
+
 def check_collision(p1, p2, obstacle_bounds, num_samples=50):
-    if not obstacle_bounds: return False
-    t = np.linspace(0, 1, num_samples)[:, np.newaxis] 
-    segment_points = p1 + t * (p2 - p1)
+    """
+    Vectorised segment–AABB collision check.
+    Returns True if the straight line p1→p2 intersects any inflated obstacle.
+    """
+    if not obstacle_bounds:
+        return False
+    t = np.linspace(0, 1, num_samples)[:, np.newaxis]
+    pts = p1 + t * (p2 - p1)
     for min_b, max_b in obstacle_bounds:
-        inside_x = (segment_points[:, 0] >= min_b[0]) & (segment_points[:, 0] <= max_b[0])
-        inside_y = (segment_points[:, 1] >= min_b[1]) & (segment_points[:, 1] <= max_b[1])
-        inside_z = (segment_points[:, 2] >= min_b[2]) & (segment_points[:, 2] <= max_b[2])
-        if np.any(inside_x & inside_y & inside_z): return True 
+        inside = (
+            (pts[:, 0] >= min_b[0]) & (pts[:, 0] <= max_b[0]) &
+            (pts[:, 1] >= min_b[1]) & (pts[:, 1] <= max_b[1]) &
+            (pts[:, 2] >= min_b[2]) & (pts[:, 2] <= max_b[2])
+        )
+        if np.any(inside):
+            return True
     return False
 
+
 def get_inflated_vertices(obs):
-    """获取障碍物膨胀 0.5m 后的 8 个安全顶点坐标 (避障跳板)"""
-    half_w, half_d, half_h = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
-    min_x, max_x = obs['x'] - half_w - 0.5, obs['x'] + half_w + 0.5
-    min_y, max_y = obs['y'] - half_d - 0.5, obs['y'] + half_d + 0.5
-    min_z, max_z = obs['z'] - half_h - 0.5, obs['z'] + half_h + 0.5
-    
+    """
+    Return the 8 corner vertices of the SAFETY_MARGIN-inflated bounding box.
+    These serve as candidate via-points when building a V-shape detour.
+    NOTE: must use the same SAFETY_MARGIN as extract_bounds so the two are consistent.
+    """
+    hw, hd, hh = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
+    min_x, max_x = obs['x'] - hw - SAFETY_MARGIN, obs['x'] + hw + SAFETY_MARGIN
+    min_y, max_y = obs['y'] - hd - SAFETY_MARGIN, obs['y'] + hd + SAFETY_MARGIN
+    min_z, max_z = obs['z'] - hh - SAFETY_MARGIN, obs['z'] + hh + SAFETY_MARGIN
+
     vertices = []
     for x in (min_x, max_x):
         for y in (min_y, max_y):
@@ -66,215 +95,298 @@ def get_inflated_vertices(obs):
                 vertices.append(np.array([x, y, z]))
     return vertices
 
+
 def calculate_shortest_detour(p1, p2, obstacle_bounds, all_obstacles_dict):
     """
-    完全体绕行大脑：
-    优先尝试 2D 侧边绕行（省电），如果遇到连体障碍物被死死挡住，
-    自动触发 3D Z轴升维跨越（飞越最高点）！
-    """
-    best_distance = float('inf')
-    best_waypoints = None 
-    
-    if not all_obstacles_dict: 
-        return best_distance, best_waypoints
-        
-    # --- 策略 1：侧边单顶点绕行 (V-shape Detour) ---
-    for obs_id, obs in all_obstacles_dict.items():
-        vertices = get_inflated_vertices(obs)
-        for v in vertices:
-            if not check_collision(p1, v, obstacle_bounds) and \
-               not check_collision(v, p2, obstacle_bounds):
-                dist = np.linalg.norm(p1 - v) + np.linalg.norm(v - p2)
-                if dist < best_distance:
-                    best_distance = dist
-                    best_waypoints = [v]
-                    
-    # --- 策略 2：如果侧边全被挡死，启动“升维电梯”飞越策略！ ---
-    if best_waypoints is None:
-        max_z = -float('inf')
-        for obs_id, obs in all_obstacles_dict.items():
-            peak = obs['z'] + (obs['h'] / 2.0)
-            if peak > max_z: 
-                max_z = peak
-                
-        safe_z = max_z + 0.5 
-        
-        wp1 = np.array([p1[0], p1[1], safe_z])
-        wp2 = np.array([p2[0], p2[1], safe_z])
-        
-        if not check_collision(p1, wp1, obstacle_bounds) and \
-           not check_collision(wp1, wp2, obstacle_bounds) and \
-           not check_collision(wp2, p2, obstacle_bounds):
-            
-            dist = np.linalg.norm(p1 - wp1) + np.linalg.norm(wp1 - wp2) + np.linalg.norm(wp2 - p2)
-            best_distance = dist
-            best_waypoints = [wp1, wp2]
+    Two-strategy detour planner:
 
-    return best_distance, best_waypoints
+    Strategy 1 – V-shape lateral detour
+        Try every inflated vertex of every obstacle as a single via-point.
+        Pick the one with the shortest total path that is collision-free on
+        both legs (p1→vertex and vertex→p2).
+
+    Strategy 2 – Z-axis elevator fly-over  (fallback)
+        If all lateral routes are blocked (connected obstacle clusters),
+        climb above the tallest obstacle in the scene and fly over.
+
+    Returns (total_detour_distance, list_of_via_points) or (inf, None) if
+    no detour could be found at all.
+    """
+    best_dist     = float('inf')
+    best_waypoints = None
+
+    if not all_obstacles_dict:
+        return best_dist, best_waypoints
+
+    # ── Strategy 1: single-vertex lateral detour ──────────────────────────
+    for obs_id, obs in all_obstacles_dict.items():
+        for v in get_inflated_vertices(obs):
+            if (not check_collision(p1, v, obstacle_bounds) and
+                    not check_collision(v, p2, obstacle_bounds)):
+                dist = np.linalg.norm(p1 - v) + np.linalg.norm(v - p2)
+                if dist < best_dist:
+                    best_dist      = dist
+                    best_waypoints = [v]
+
+    # ── Strategy 2: Z-elevator fly-over (only if strategy 1 found nothing) ─
+    if best_waypoints is None:
+        max_peak = max(
+            obs['z'] + obs['h'] / 2.0
+            for obs in all_obstacles_dict.values()
+        )
+        safe_z = max_peak + SAFETY_MARGIN
+
+        wp_up   = np.array([p1[0], p1[1], safe_z])
+        wp_over = np.array([p2[0], p2[1], safe_z])
+
+        if (not check_collision(p1, wp_up,   obstacle_bounds) and
+                not check_collision(wp_up, wp_over, obstacle_bounds) and
+                not check_collision(wp_over, p2,    obstacle_bounds)):
+
+            dist = (np.linalg.norm(p1 - wp_up) +
+                    np.linalg.norm(wp_up - wp_over) +
+                    np.linalg.norm(wp_over - p2))
+            best_dist      = dist
+            best_waypoints = [wp_up, wp_over]
+
+    return best_dist, best_waypoints
+
 
 def build_cost_matrix(scenario_data):
-    """构建真实的 N x N 物理代价矩阵，并记录避障路点"""
+    """
+    Build the N×N real-world cost matrix.
+
+    Index 0     = drone start position
+    Index 1…N-1 = viewpoints (sorted by key)
+
+    Also returns waypoints_matrix: dict[(i,j)] → list of via-point arrays
+    that the drone must physically visit when flying from node i to node j.
+    """
     points = []
-    start_pose = scenario_data['drone_start_pose']
-    points.append([start_pose['x'], start_pose['y'], start_pose['z']])
-    
+    start  = scenario_data['drone_start_pose']
+    points.append([start['x'], start['y'], start['z']])
+
     vp_poses = scenario_data['viewpoint_poses']
-    vp_ids = sorted(vp_poses.keys()) 
-    for vp_id in vp_ids:
-        vp = vp_poses[vp_id]
+    vp_ids   = sorted(vp_poses.keys())
+    for vpid in vp_ids:
+        vp = vp_poses[vpid]
         points.append([vp['x'], vp['y'], vp['z']])
-        
-    points_array = np.array(points)
-    N = len(points_array)
+
+    points_array   = np.array(points)
+    N              = len(points_array)
     obstacles_dict = scenario_data.get('obstacles', {})
     obstacle_bounds = extract_bounds(obstacles_dict)
-    
-    cost_matrix = np.zeros((N, N))
+
+    cost_matrix     = np.zeros((N, N))
     waypoints_matrix = {}
-    
+
     for i in range(N):
         for j in range(N):
-            if i == j: continue
-            straight_dist = np.linalg.norm(points_array[i] - points_array[j])
-            
-            if check_collision(points_array[i], points_array[j], obstacle_bounds):
-                detour_dist, waypoint_list = calculate_shortest_detour(
-                    points_array[i], points_array[j], obstacle_bounds, obstacles_dict
+            if i == j:
+                continue
+            p1, p2 = points_array[i], points_array[j]
+            straight = np.linalg.norm(p1 - p2)
+
+            if check_collision(p1, p2, obstacle_bounds):
+                detour_dist, wp_list = calculate_shortest_detour(
+                    p1, p2, obstacle_bounds, obstacles_dict
                 )
-                if waypoint_list is not None:
-                    cost_matrix[i][j] = detour_dist
-                    waypoints_matrix[(i, j)] = waypoint_list 
+                if wp_list is not None:
+                    cost_matrix[i][j]     = detour_dist
+                    waypoints_matrix[(i, j)] = wp_list
                 else:
-                    cost_matrix[i][j] = straight_dist * 100.0 
+                    # Last resort: heavy penalty so TSP avoids this edge
+                    cost_matrix[i][j] = straight * 100.0
             else:
-                cost_matrix[i][j] = straight_dist
-                
+                cost_matrix[i][j] = straight
+
     return cost_matrix, vp_ids, points_array, waypoints_matrix
 
 
-# ==========================================================
-# 🚁 物理执行模块：携带“剧本”的智能飞行
-# ==========================================================
+# ==========================================================================
+# 🚁  EXECUTION MODULE — drone control
+# ==========================================================================
+
+def _exec_speed(from_pos, to_pos):
+    """
+    Pick execution speed based on the height difference of the leg.
+    Vertical legs (climbs / descents) get the slowest speed to fight inertia.
+    Lateral detour corners get a medium speed.
+    """
+    height_delta = abs(float(to_pos[2]) - float(from_pos[2]))
+    if height_delta > VERTICAL_THRESHOLD:
+        return SPEED_VERTICAL
+    return SPEED_LATERAL
+
 
 def drone_start(drone_interface: DroneInterface) -> bool:
-    print('[LOG] 🛫 Start mission sequence...')
-    success = drone_interface.arm()
-    success = success and drone_interface.offboard()
-    success = success and drone_interface.takeoff(height=TAKE_OFF_HEIGHT, speed=TAKE_OFF_SPEED)
-    return success
+    print('[LOG] 🛫  Arming and taking off...')
+    ok = drone_interface.arm()
+    ok = ok and drone_interface.offboard()
+    ok = ok and drone_interface.takeoff(height=TAKE_OFF_HEIGHT, speed=TAKE_OFF_SPEED)
+    print(f'[LOG] Take-off: {"✅ OK" if ok else "❌ FAILED"}')
+    return ok
+
 
 def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) -> bool:
-    print('\n[LOG] === 🧠 PHASE 1: ENVIRONMENT-AWARE PLANNING ===')
-    
-    start_algo_time = time.time()
+    print('\n[LOG] ═══════════════════════════════════════════════════')
+    print('[LOG] 🧠  PHASE 1 — ENVIRONMENT-AWARE PATH PLANNING')
+    print('[LOG] ═══════════════════════════════════════════════════')
+
+    t0     = time.time()
     matrix, original_vp_ids, points_array, waypoints_matrix = build_cost_matrix(scenario)
     route_indices, _ = solve_tsp_local_search(matrix)
-    algo_time = time.time() - start_algo_time
-    
+    algo_time = time.time() - t0
+
+    print(f'[LOG] Planning time   : {algo_time:.4f} s')
+    print(f'[LOG] TSP route       : {route_indices}')
+
+    print('\n[LOG] ═══════════════════════════════════════════════════')
+    print('[LOG] 🚁  PHASE 2 — TACTICAL EXECUTION')
+    print('[LOG] ═══════════════════════════════════════════════════')
+
     planned_distance = 0.0
-    optimized_vpids = []
+    optimized_vpids  = []
 
-    print(f'[LOG] Algorithm Computation Time: {algo_time:.4f} seconds')
-    print('\n[LOG] === 🚁 PHASE 2: TACTICAL EXECUTION ===')
-    
     for step in range(len(route_indices) - 1):
-        idx_current = route_indices[step]
+        idx_curr = route_indices[step]
         idx_next = route_indices[step + 1]
-        
-        vpid = original_vp_ids[idx_next - 1]
-        vp = scenario["viewpoint_poses"][vpid]
-        optimized_vpids.append(vpid)
-        goal = [vp["x"], vp["y"], vp["z"]]
-        
-        if (idx_current, idx_next) in waypoints_matrix:
-            wp_list = waypoints_matrix[(idx_current, idx_next)]
-            current_pos = points_array[idx_current]
-            
-            for wp in wp_list:
-                planned_distance += np.linalg.norm(current_pos - wp)
-                print(f'[LOG] ⚠️ Executing tactical waypoint: [x={wp[0]:.2f}, y={wp[1]:.2f}, z={wp[2]:.2f}]')
-                
-                success = drone_interface.go_to.go_to_point_with_yaw([float(wp[0]), float(wp[1]), float(wp[2])], angle=vp["w"], speed=SPEED * 0.8)
-                if not success: return False
-                current_pos = wp
-                
-            planned_distance += np.linalg.norm(current_pos - points_array[idx_next])
-            
-        else:
-            planned_distance += np.linalg.norm(points_array[idx_current] - points_array[idx_next])
 
-        print(f'[LOG] >>> Proceeding to Target Viewpoint {vpid} (Pose: x={vp["x"]:.2f}, y={vp["y"]:.2f}, yaw={vp["w"]:.2f})')
-        success = drone_interface.go_to.go_to_point_with_yaw(goal, angle=vp["w"], speed=SPEED)
-        
-        if not success:
+        # idx_next == 0 means TSP wants to return to start; skip (open-path mission)
+        if idx_next == 0:
+            continue
+
+        vpid = original_vp_ids[idx_next - 1]
+        vp   = scenario['viewpoint_poses'][vpid]
+        goal = [float(vp['x']), float(vp['y']), float(vp['z'])]
+        optimized_vpids.append(vpid)
+
+        current_pos = points_array[idx_curr]
+
+        # ── Execute intermediate via-points (detour or elevator) if any ──
+        if (idx_curr, idx_next) in waypoints_matrix:
+            for wp in waypoints_matrix[(idx_curr, idx_next)]:
+                wp_f = [float(wp[0]), float(wp[1]), float(wp[2])]
+                spd  = _exec_speed(current_pos, wp)
+
+                print(f'[LOG] ⚠️  Via-point  [{wp_f[0]:.2f}, {wp_f[1]:.2f}, {wp_f[2]:.2f}]'
+                      f'  speed={spd:.2f}')
+
+                ok = drone_interface.go_to.go_to_point_with_yaw(
+                    wp_f, angle=float(vp['w']), speed=spd
+                )
+                if not ok:
+                    print(f'[ERROR] ❌ Failed at via-point for VP {vpid}')
+                    return False
+
+                planned_distance += np.linalg.norm(current_pos - wp)
+                current_pos = wp
+
+        planned_distance += np.linalg.norm(current_pos - points_array[idx_next])
+
+        # ── Fly to the actual viewpoint ────────────────────────────────────
+        print(f'[LOG] >>> Viewpoint {vpid}  (x={vp["x"]:.2f}  y={vp["y"]:.2f}'
+              f'  z={vp["z"]:.2f}  yaw={vp["w"]:.2f})  speed={SPEED_CRUISE:.2f}')
+
+        ok = drone_interface.go_to.go_to_point_with_yaw(
+            goal, angle=float(vp['w']), speed=SPEED_CRUISE
+        )
+        if not ok:
             print(f'[ERROR] ❌ Failed to reach Viewpoint {vpid}!')
             return False
-            
-        print(f'[LOG] ✅ Reached Viewpoint {vpid}. (Simulating Camera Trigger...)')
+
+        print(f'[LOG] ✅  Reached Viewpoint {vpid}.')
         sleep(SLEEP_TIME)
 
-    metrics['algo_time'] = algo_time
+    metrics['algo_time']      = algo_time
     metrics['planned_distance'] = planned_distance
-    metrics['visit_order'] = optimized_vpids
-
+    metrics['visit_order']    = optimized_vpids
     return True
 
-def drone_end(drone_interface: DroneInterface) -> bool:
-    print('\n[LOG] 🛬 Ending mission (Landing sequence initiated)...')
-    success = drone_interface.land(speed=LAND_SPEED)
-    success = success and drone_interface.manual()
-    return success
 
-def read_scenario(file_path):
-    with open(file_path, 'r') as file:
-        scenario = yaml.safe_load(file)
-    return scenario
+def drone_end(drone_interface: DroneInterface) -> bool:
+    """Land and switch to manual. Called AFTER the mission timer has stopped."""
+    print('\n[LOG] 🛬  Landing sequence (NOT counted in mission time)...')
+    ok = drone_interface.land(speed=LAND_SPEED)
+    ok = ok and drone_interface.manual()
+    print(f'[LOG] Land: {"✅ OK" if ok else "❌ FAILED"}')
+    return ok
+
+
+def read_scenario(file_path: str) -> dict:
+    with open(file_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+# ==========================================================================
+# 📊  ENTRY POINT & POST-FLIGHT REPORT
+# ==========================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Method 2: Environment-Aware TSP (Ultimate)')
-    parser.add_argument('scenario', type=str, help="scenario file")
-    parser.add_argument('-n', '--namespace', type=str, default='drone0')
-    parser.add_argument('-v', '--verbose', action='store_true', default=False)
+    parser = argparse.ArgumentParser(
+        description='Method 2 – Environment-Aware TSP (Fixed: margin=0.35, dynamic speed)')
+    parser.add_argument('scenario',        type=str,            help='Path to scenario YAML')
+    parser.add_argument('-n', '--namespace',   type=str, default='drone0')
+    parser.add_argument('-v', '--verbose',     action='store_true', default=False)
     parser.add_argument('-s', '--use_sim_time', action='store_true', default=True)
-
     args = parser.parse_args()
+
+    print('=' * 52)
+    print('🚀  METHOD 2 — ENVIRONMENT-AWARE TSP  (FIXED)')
+    print(f'    Scenario     : {args.scenario}')
+    print(f'    Drone ID     : {args.namespace}')
+    print(f'    SafetyMargin : {SAFETY_MARGIN} m')
+    print('=' * 52)
+
     scenario = read_scenario(args.scenario)
     rclpy.init()
 
-    uav = DroneInterface(drone_id=args.namespace, use_sim_time=args.use_sim_time, verbose=args.verbose)
-    
-    mission_metrics = {'algo_time': 0.0, 'planned_distance': 0.0, 'visit_order': [], 'mission_success': False, 'total_time': 0.0}
-    start_total_time = time.time()
-    
+    uav = DroneInterface(
+        drone_id=args.namespace,
+        use_sim_time=args.use_sim_time,
+        verbose=args.verbose
+    )
+
+    mission_metrics = {
+        'algo_time':        0.0,
+        'planned_distance': 0.0,
+        'visit_order':      [],
+        'mission_success':  False,
+        'total_time':       0.0,   # flight only, landing excluded
+    }
+
+    t_mission_start = time.time()
     success = drone_start(uav)
+
     try:
         if success:
-            flight_success = drone_run(uav, scenario, mission_metrics)
-            mission_metrics['mission_success'] = flight_success
-            
-            # 【核心修改点】：在打卡完最后一个目标点后，立即停止计时！不计入降落的物理延迟。
-            mission_metrics['total_time'] = time.time() - start_total_time
-            
+            flight_ok = drone_run(uav, scenario, mission_metrics)
+            mission_metrics['mission_success'] = flight_ok
+
+        # ══ STOP THE CLOCK HERE — before landing ══
+        mission_metrics['total_time'] = time.time() - t_mission_start
+
     except KeyboardInterrupt:
-        print("\n[WARNING] Mission interrupted by user!")
-        # 如果中断，也只记录到中断时的飞行时间
-        mission_metrics['total_time'] = time.time() - start_total_time
+        mission_metrics['total_time'] = time.time() - t_mission_start
+        print('\n[WARNING] Mission interrupted by user.')
+
     finally:
-        # 降落操作放在计时结束后执行
+        # Landing happens after timing — does not inflate the score
         drone_end(uav)
 
     uav.shutdown()
     rclpy.shutdown()
-    
-    # 终极硬核数据报告
-    print("\n==================================================")
-    print("📈 MISSION POST-FLIGHT REPORT (METHOD 2: ULTIMATE)")
-    print("==================================================")
-    print(f"Algorithm Strategy:  Adaptive Detour (V-Shape + Z-Elevator)")
-    print(f"Status:              {'✅ SUCCESS' if mission_metrics['mission_success'] else '❌ FAILED'}")
-    print(f"Algorithm Time:      {mission_metrics['algo_time']:.4f} seconds")
-    print(f"Net Flight Time:     {mission_metrics['total_time']:.2f} seconds (Excluding Landing)")
-    print(f"Flight Distance:     {mission_metrics['planned_distance']:.2f} meters (True Physical Distance)")
-    print(f"Path Visited:        START -> {' -> '.join(map(str, mission_metrics['visit_order']))}")
-    print("==================================================")
+
+    # ── Post-flight report ─────────────────────────────────────────────────
+    print('\n' + '=' * 52)
+    print('📈  POST-FLIGHT REPORT  (METHOD 2 — FIXED)')
+    print('=' * 52)
+    print(f"Strategy         : Adaptive Detour (V-Shape + Z-Elevator)")
+    print(f"Safety Margin    : {SAFETY_MARGIN} m")
+    print(f"Status           : {'✅ SUCCESS' if mission_metrics['mission_success'] else '❌ FAILED'}")
+    print(f"Algorithm Time   : {mission_metrics['algo_time']:.4f} s")
+    print(f"Net Mission Time : {mission_metrics['total_time']:.2f} s  (landing excluded)")
+    print(f"Flight Distance  : {mission_metrics['planned_distance']:.2f} m  (true physical)")
+    print(f"Path Visited     : START -> {' -> '.join(map(str, mission_metrics['visit_order']))}")
+    print('=' * 52)
     exit(0)
