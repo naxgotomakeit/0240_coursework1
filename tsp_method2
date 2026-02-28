@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+# ==============================================================================
+# MASTER'S NOTE: Method 2 - Environment-Aware TSP (Visibility Graph Detour)
+# Date Authored: 2026-01-06
+# Description: This advanced system uses a 3D bounding box vertex heuristic to 
+#              generate collision-free detours, calculating true physical distance 
+#              before feeding it to the TSP solver.
+# ==============================================================================
+
+import argparse
+from time import sleep
+import time
+import yaml
+import numpy as np
+
+# 导入 TSP 求解器
+from python_tsp.heuristics import solve_tsp_local_search
+from as2_python_api.drone_interface import DroneInterface
+import rclpy
+
+TAKE_OFF_HEIGHT = 1.0  
+TAKE_OFF_SPEED = 1.0  
+SLEEP_TIME = 0.5  
+SPEED = 1.0  
+LAND_SPEED = 0.5  
+
+# ==========================================================
+# 🧠 大脑模块：几何可视图与真实代价推演
+# ==========================================================
+
+def extract_bounds(obstacles_dict):
+    bounds = []
+    if not obstacles_dict: return bounds
+    for obs_id, obs in obstacles_dict.items():
+        half_w, half_d, half_h = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
+        min_b = np.array([obs['x'] - half_w, obs['y'] - half_d, obs['z'] - half_h]) - 0.3
+        max_b = np.array([obs['x'] + half_w, obs['y'] + half_d, obs['z'] + half_h]) + 0.3
+        bounds.append((min_b, max_b))
+    return bounds
+
+def check_collision(p1, p2, obstacle_bounds, num_samples=50):
+    if not obstacle_bounds: return False
+    t = np.linspace(0, 1, num_samples)[:, np.newaxis] 
+    segment_points = p1 + t * (p2 - p1)
+    for min_b, max_b in obstacle_bounds:
+        inside_x = (segment_points[:, 0] >= min_b[0]) & (segment_points[:, 0] <= max_b[0])
+        inside_y = (segment_points[:, 1] >= min_b[1]) & (segment_points[:, 1] <= max_b[1])
+        inside_z = (segment_points[:, 2] >= min_b[2]) & (segment_points[:, 2] <= max_b[2])
+        if np.any(inside_x & inside_y & inside_z): return True 
+    return False
+
+def get_inflated_vertices(obs):
+    """获取障碍物膨胀 0.3m 后的 8 个安全顶点坐标 (避障跳板)"""
+    half_w, half_d, half_h = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
+    min_x, max_x = obs['x'] - half_w - 0.3, obs['x'] + half_w + 0.3
+    min_y, max_y = obs['y'] - half_d - 0.3, obs['y'] + half_d + 0.3
+    min_z, max_z = obs['z'] - half_h - 0.3, obs['z'] + half_h + 0.3
+    
+    vertices = []
+    for x in (min_x, max_x):
+        for y in (min_y, max_y):
+            for z in (min_z, max_z):
+                vertices.append(np.array([x, y, z]))
+    return vertices
+
+def calculate_shortest_detour(p1, p2, obstacle_bounds, all_obstacles_dict):
+    """计算从 p1 绕过盒子顶点到达 p2 的最短折线距离"""
+    best_distance = float('inf')
+    best_waypoint = None
+    
+    if not all_obstacles_dict: 
+        return best_distance, best_waypoint
+        
+    for obs_id, obs in all_obstacles_dict.items():
+        vertices = get_inflated_vertices(obs)
+        for v in vertices:
+            # 几何检验：A连到顶点、顶点连到B，这两段线是否安全？
+            if not check_collision(p1, v, obstacle_bounds) and \
+               not check_collision(v, p2, obstacle_bounds):
+                dist = np.linalg.norm(p1 - v) + np.linalg.norm(v - p2)
+                if dist < best_distance:
+                    best_distance = dist
+                    best_waypoint = v
+                    
+    return best_distance, best_waypoint
+
+def build_cost_matrix(scenario_data):
+    """构建真实的 N x N 物理代价矩阵，并记录避障路点"""
+    points = []
+    start_pose = scenario_data['drone_start_pose']
+    points.append([start_pose['x'], start_pose['y'], start_pose['z']])
+    
+    vp_poses = scenario_data['viewpoint_poses']
+    vp_ids = sorted(vp_poses.keys()) 
+    for vp_id in vp_ids:
+        vp = vp_poses[vp_id]
+        points.append([vp['x'], vp['y'], vp['z']])
+        
+    points_array = np.array(points)
+    N = len(points_array)
+    obstacles_dict = scenario_data.get('obstacles', {})
+    obstacle_bounds = extract_bounds(obstacles_dict)
+    
+    cost_matrix = np.zeros((N, N))
+    waypoints_matrix = {} # 记忆迷宫：记录哪两条路之间需要走哪个绕行点
+    
+    for i in range(N):
+        for j in range(N):
+            if i == j: continue
+            straight_dist = np.linalg.norm(points_array[i] - points_array[j])
+            
+            # 核心战术转换：发现障碍物后不再盲目惩罚，而是寻找真实绕路代价
+            if check_collision(points_array[i], points_array[j], obstacle_bounds):
+                detour_dist, waypoint = calculate_shortest_detour(
+                    points_array[i], points_array[j], obstacle_bounds, obstacles_dict
+                )
+                if waypoint is not None:
+                    cost_matrix[i][j] = detour_dist
+                    waypoints_matrix[(i, j)] = waypoint # 记下剧本
+                else:
+                    # 极端的“死胡同”保底机制
+                    cost_matrix[i][j] = straight_dist * 100.0 
+            else:
+                cost_matrix[i][j] = straight_dist
+                
+    return cost_matrix, vp_ids, points_array, waypoints_matrix
+
+
+# ==========================================================
+# 🚁 物理执行模块：携带“剧本”的智能飞行
+# ==========================================================
+
+def drone_start(drone_interface: DroneInterface) -> bool:
+    print('[LOG] 🛫 Start mission sequence...')
+    success = drone_interface.arm()
+    success = success and drone_interface.offboard()
+    success = success and drone_interface.takeoff(height=TAKE_OFF_HEIGHT, speed=TAKE_OFF_SPEED)
+    return success
+
+def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) -> bool:
+    print('\n[LOG] === 🧠 PHASE 1: ENVIRONMENT-AWARE PLANNING ===')
+    
+    start_algo_time = time.time()
+    matrix, original_vp_ids, points_array, waypoints_matrix = build_cost_matrix(scenario)
+    route_indices, _ = solve_tsp_local_search(matrix)
+    algo_time = time.time() - start_algo_time
+    
+    planned_distance = 0.0
+    optimized_vpids = []
+
+    print(f'[LOG] Algorithm Computation Time: {algo_time:.4f} seconds')
+    print('\n[LOG] === 🚁 PHASE 2: TACTICAL EXECUTION ===')
+    
+    # 根据最优顺序，逐段解析“剧本”并飞行
+    for step in range(len(route_indices) - 1):
+        idx_current = route_indices[step]
+        idx_next = route_indices[step + 1]
+        
+        # 提取目标点的信息
+        vpid = original_vp_ids[idx_next - 1]
+        vp = scenario["viewpoint_poses"][vpid]
+        optimized_vpids.append(vpid)
+        goal = [vp["x"], vp["y"], vp["z"]]
+        
+        # 1. 检查当前节点到目标节点是否需要“绕弯路”
+        if (idx_current, idx_next) in waypoints_matrix:
+            wp = waypoints_matrix[(idx_current, idx_next)]
+            planned_distance += np.linalg.norm(points_array[idx_current] - wp)
+            planned_distance += np.linalg.norm(wp - points_array[idx_next])
+            
+            print(f'[LOG] ⚠️ Obstacle detected! Detouring via geometric vertex: [x={wp[0]:.2f}, y={wp[1]:.2f}, z={wp[2]:.2f}]')
+            
+            # 飞向中转绕行点 (Waypoint) - 不需要悬停拍照，到了就走
+            success = drone_interface.go_to.go_to_point_with_yaw([float(wp[0]), float(wp[1]), float(wp[2])], angle=vp["w"], speed=SPEED)
+            if not success: return False
+            
+        else:
+            planned_distance += np.linalg.norm(points_array[idx_current] - points_array[idx_next])
+
+        # 2. 飞向真正的目标观察点 (Viewpoint)
+        print(f'[LOG] >>> Proceeding to Target Viewpoint {vpid} (Pose: x={vp["x"]:.2f}, y={vp["y"]:.2f}, yaw={vp["w"]:.2f})')
+        success = drone_interface.go_to.go_to_point_with_yaw(goal, angle=vp["w"], speed=SPEED)
+        
+        if not success:
+            print(f'[ERROR] ❌ Failed to reach Viewpoint {vpid}!')
+            return False
+            
+        print(f'[LOG] ✅ Reached Viewpoint {vpid}. (Simulating Camera Trigger...)')
+        sleep(SLEEP_TIME)
+
+    # 记录最终指标
+    metrics['algo_time'] = algo_time
+    metrics['planned_distance'] = planned_distance
+    metrics['visit_order'] = optimized_vpids
+
+    return True
+
+def drone_end(drone_interface: DroneInterface) -> bool:
+    print('\n[LOG] 🛬 Ending mission...')
+    success = drone_interface.land(speed=LAND_SPEED)
+    success = success and drone_interface.manual()
+    return success
+
+def read_scenario(file_path):
+    with open(file_path, 'r') as file:
+        scenario = yaml.safe_load(file)
+    return scenario
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Method 2: Environment-Aware TSP')
+    parser.add_argument('scenario', type=str, help="scenario file")
+    parser.add_argument('-n', '--namespace', type=str, default='drone0')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False)
+    parser.add_argument('-s', '--use_sim_time', action='store_true', default=True)
+
+    args = parser.parse_args()
+    scenario = read_scenario(args.scenario)
+    rclpy.init()
+
+    uav = DroneInterface(drone_id=args.namespace, use_sim_time=args.use_sim_time, verbose=args.verbose)
+    
+    mission_metrics = {'algo_time': 0.0, 'planned_distance': 0.0, 'visit_order': [], 'mission_success': False, 'total_time': 0.0}
+    start_total_time = time.time()
+    
+    success = drone_start(uav)
+    try:
+        if success:
+            flight_success = drone_run(uav, scenario, mission_metrics)
+            mission_metrics['mission_success'] = flight_success
+    except KeyboardInterrupt:
+        print("\n[WARNING] Mission interrupted by user!")
+    finally:
+        drone_end(uav)
+        
+    mission_metrics['total_time'] = time.time() - start_total_time
+
+    uav.shutdown()
+    rclpy.shutdown()
+    
+    # 终极硬核数据报告
+    print("\n==================================================")
+    print("📈 MISSION POST-FLIGHT REPORT (METHOD 2)")
+    print("==================================================")
+    print(f"Algorithm Strategy:  Geometric Detour + TSP Optimization")
+    print(f"Status:              {'✅ SUCCESS' if mission_metrics['mission_success'] else '❌ FAILED'}")
+    print(f"Algorithm Time:      {mission_metrics['algo_time']:.4f} seconds")
+    print(f"Total Time:          {mission_metrics['total_time']:.2f} seconds")
+    print(f"Flight Distance:     {mission_metrics['planned_distance']:.2f} meters (True Physical Distance)")
+    print(f"Path Visited:        START -> {' -> '.join(map(str, mission_metrics['visit_order']))}")
+    print("==================================================")
+    exit(0)
