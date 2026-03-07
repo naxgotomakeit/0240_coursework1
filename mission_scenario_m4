@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# Method 4 - Adaptive TSP (Auto-selects solver and vertical penalty)
-# M4 analyses the scene before planning and self-configures:
+# Method 4 (M4) — Scene-Adaptive Hybrid Strategy
+# M4 analyses the scene before planning and self-configures both the TSP solver
+# and the vertical penalty, making M2 and M3 special cases of M4.
 #
-#   Solver:
-#     - No obstacles → Local Search  (fast, deterministic, optimal on simple maps)
-#     - Has obstacles → Simulated Annealing  (escapes local optima on complex maps)
+# Solver selection (based on obstacle presence):
+#   No obstacles  → Local Search  (fast, deterministic, optimal on simple maps)
+#   Has obstacles → Simulated Annealing  (escapes local optima on complex maps)
 #
-#   Vertical Penalty:
-#     - height StdDev < 0.5m  → 1.0  (no penalty, pure Euclidean like M2)
-#     - height StdDev < 1.5m  → 1.8  (moderate)
-#     - height StdDev ≥ 1.5m  → 2.3  (strong penalty like M3)
+# Vertical penalty selection (based on viewpoint altitude standard deviation):
+#   height_std < 0.5 m  → 1.0  (no penalty, pure Euclidean — equivalent to M2)
+#   height_std < 1.5 m  → 1.8  (moderate penalty)
+#   height_std >= 1.5 m → 2.3  (strong penalty — equivalent to M3)
 #
-#   M2 and M3 are therefore special cases of M4.
+# Known limitation:
+#   SA processing time (SA_MAX_TIME) is fixed and does not scale with viewpoint
+#   count. Performance may degrade for scenarios with more than ~15 viewpoints,
+#   as observed in Scenario 3. Future improvement: incorporate viewpoint count
+#   into the adaptive logic to dynamically extend SA_MAX_TIME.
 # ==============================================================================
 
 import argparse
@@ -34,46 +39,52 @@ SPEED           = 1.5
 LAND_SPEED      = 0.5
 
 # ── Speed Profiles ─────────────────────────────────────────────────────────────
-SPEED_VERTICAL  = SPEED * 0.6
-SPEED_LATERAL   = SPEED * 0.8
-SPEED_CRUISE    = SPEED
+SPEED_VERTICAL  = SPEED * 0.6   # Climbs and descents
+SPEED_LATERAL   = SPEED * 0.8   # Lateral detour corners
+SPEED_CRUISE    = SPEED         # Final approach to viewpoint
 
 # ── Safety / Collision Parameters ─────────────────────────────────────────────
-SAFETY_MARGIN      = 0.35
-VERTICAL_THRESHOLD = 0.8    # metres — height delta above which a leg is "vertical"
+SAFETY_MARGIN      = 0.35   # Inflate all obstacle AABBs by this value (metres)
+VERTICAL_THRESHOLD = 0.8    # Height delta above which a leg is treated as vertical
 
 # ── SA Solver Parameters ───────────────────────────────────────────────────────
-SA_MAX_TIME = 10   # seconds per SA run
+SA_MAX_TIME = 10   # Maximum SA processing time per run (seconds)
+                   # Inherited by M4 when SA is selected. Sufficient for up to
+                   # ~10 viewpoints; becomes a limiting factor beyond ~15.
 
-# ── Adaptive Thresholds (do not normally need changing) ───────────────────────
-HEIGHT_STD_LOW  = 0.5   # below this → no vertical penalty (pure Euclidean)
-HEIGHT_STD_HIGH = 1.5   # above this → full vertical penalty
-PENALTY_LOW     = 1.0
-PENALTY_MID     = 1.8
-PENALTY_HIGH    = 2.3
+# ── Adaptive Thresholds ────────────────────────────────────────────────────────
+HEIGHT_STD_LOW  = 0.5   # Below this → no vertical penalty (pure Euclidean, M2 behaviour)
+HEIGHT_STD_HIGH = 1.5   # Above this → full vertical penalty (M3 behaviour)
+PENALTY_LOW     = 1.0   # Equivalent to M2
+PENALTY_MID     = 1.8   # Intermediate
+PENALTY_HIGH    = 2.3   # Equivalent to M3
 
 
 # ==========================================================================
-# 🔍  SCENE ANALYSER — decides which strategy to use
+# SCENE ANALYSER — Selects solver and vertical penalty based on scene data
 # ==========================================================================
 
 def analyse_scene(points_array, obstacles_dict):
     """
-    Look at the environment and return the best solver and vertical penalty.
+    Inspect the environment and return the optimal solver and vertical penalty.
 
-    Returns
-    -------
-    solver_name     : str   — 'local_search' or 'simulated_annealing'
-    vertical_penalty: float — multiplier applied to |Δz| in weighted_distance()
+    Solver decision: presence of any obstacle triggers SA over Local Search,
+    since obstacle-rich scenes produce complex cost matrices where Local Search
+    is prone to local optima.
+
+    Penalty decision: viewpoint altitude standard deviation determines how much
+    vertical travel should be penalised. Low std dev means viewpoints are at
+    similar heights and vertical penalty adds no benefit.
+
+    Returns:
+        solver_name      : str   — 'local_search' or 'simulated_annealing'
+        vertical_penalty : float — multiplier applied to |dz| in weighted_distance()
     """
-    has_obstacles   = len(obstacles_dict) > 0
-    heights         = points_array[:, 2]
-    height_std      = float(np.std(heights))
+    has_obstacles = len(obstacles_dict) > 0
+    height_std    = float(np.std(points_array[:, 2]))
 
-    # ── Choose solver ──────────────────────────────────────────────────────
     solver_name = 'simulated_annealing' if has_obstacles else 'local_search'
 
-    # ── Choose vertical penalty ────────────────────────────────────────────
     if height_std < HEIGHT_STD_LOW:
         vertical_penalty = PENALTY_LOW
     elif height_std < HEIGHT_STD_HIGH:
@@ -82,19 +93,22 @@ def analyse_scene(points_array, obstacles_dict):
         vertical_penalty = PENALTY_HIGH
 
     print(f'[M4] Scene analysis:')
-    print(f'[M4]   Obstacles present : {has_obstacles}  ({len(obstacles_dict)} objects)')
-    print(f'[M4]   Viewpoint height StdDev : {height_std:.3f} m')
-    print(f'[M4]   → Solver selected  : {solver_name}')
-    print(f'[M4]   → Vertical penalty : {vertical_penalty}×')
+    print(f'[M4]   Obstacles present       : {has_obstacles}  ({len(obstacles_dict)} objects)')
+    print(f'[M4]   Viewpoint height std dev : {height_std:.3f} m')
+    print(f'[M4]   Solver selected          : {solver_name}')
+    print(f'[M4]   Vertical penalty         : {vertical_penalty}x')
 
     return solver_name, vertical_penalty
 
 
 # ==========================================================================
-# 🧠  BRAIN MODULE — geometry, collision, detour planning
+# PLANNING MODULE — Geometry, Collision Detection, Detour Planning
 # ==========================================================================
 
 def extract_bounds(obstacles_dict):
+    """
+    Return AABB bounds for every obstacle, inflated by SAFETY_MARGIN on all sides.
+    """
     bounds = []
     if not obstacles_dict:
         return bounds
@@ -107,6 +121,10 @@ def extract_bounds(obstacles_dict):
 
 
 def check_collision(p1, p2, obstacle_bounds, num_samples=20):
+    """
+    Vectorised segment-AABB collision check with 20 interpolated sample points.
+    Returns True if the straight line p1->p2 intersects any inflated obstacle.
+    """
     if not obstacle_bounds:
         return False
     t   = np.linspace(0, 1, num_samples)[:, np.newaxis]
@@ -124,9 +142,13 @@ def check_collision(p1, p2, obstacle_bounds, num_samples=20):
 
 def weighted_distance(p1, p2, vertical_penalty):
     """
-    Lateral Euclidean XY distance + penalised vertical distance.
-    vertical_penalty=1.0 → pure Euclidean (M2 behaviour)
-    vertical_penalty=2.3 → strongly discourages altitude changes (M3 behaviour)
+    Vertically-weighted cost metric used in both the TSP cost matrix and
+    the detour planner, ensuring both use a consistent cost definition.
+
+    cost(p1, p2) = lateral XY distance + |dz| x vertical_penalty
+
+    vertical_penalty = 1.0  →  pure Euclidean (M2 behaviour)
+    vertical_penalty = 2.3  →  strongly discourages altitude changes (M3 behaviour)
     """
     lateral  = np.linalg.norm(p1[:2] - p2[:2])
     vertical = abs(p1[2] - p2[2]) * vertical_penalty
@@ -134,6 +156,11 @@ def weighted_distance(p1, p2, vertical_penalty):
 
 
 def get_inflated_vertices(obs):
+    """
+    Return the 8 corner vertices of the SAFETY_MARGIN-inflated AABB.
+    Used as candidate via-points for V-shape single-vertex detours.
+    Must use the same SAFETY_MARGIN as extract_bounds to stay consistent.
+    """
     hw, hd, hh = obs['w'] / 2.0, obs['d'] / 2.0, obs['h'] / 2.0
     xs = (obs['x'] - hw - SAFETY_MARGIN, obs['x'] + hw + SAFETY_MARGIN)
     ys = (obs['y'] - hd - SAFETY_MARGIN, obs['y'] + hd + SAFETY_MARGIN)
@@ -143,9 +170,22 @@ def get_inflated_vertices(obs):
 
 def calculate_shortest_detour(p1, p2, obstacle_bounds, all_obstacles_dict, vertical_penalty):
     """
-    Strategy 1: V-shape lateral detour via obstacle corner vertices.
-    Strategy 2: Z-axis elevator fly-over (fallback for blocked corridors).
-    Uses weighted_distance so detour cost matches the TSP cost metric exactly.
+    Two-strategy detour planner. Uses weighted_distance so detour cost
+    is consistent with the TSP cost matrix.
+
+    Strategy 1 - V-shape lateral detour:
+        Test every inflated corner vertex of every obstacle as a single via-point.
+        Select the vertex yielding the lowest weighted cost where both legs
+        (p1->vertex and vertex->p2) are collision-free.
+
+    Strategy 2 - Z-axis elevator fly-over (fallback):
+        Triggered when all lateral routes are blocked by connected obstacle clusters.
+        Drone climbs above tallest obstacle peak + SAFETY_MARGIN, traverses
+        horizontally, then descends.
+
+    Returns:
+        (weighted_detour_cost, list_of_via_points)
+        Returns (inf, None) if no valid detour is found.
     """
     best_cost      = float('inf')
     best_waypoints = None
@@ -153,7 +193,7 @@ def calculate_shortest_detour(p1, p2, obstacle_bounds, all_obstacles_dict, verti
     if not all_obstacles_dict:
         return best_cost, best_waypoints
 
-    # ── Strategy 1: single-vertex lateral detour ──────────────────────────
+    # Strategy 1: single-vertex lateral detour
     for obs in all_obstacles_dict.values():
         for v in get_inflated_vertices(obs):
             if (not check_collision(p1, v, obstacle_bounds) and
@@ -164,7 +204,7 @@ def calculate_shortest_detour(p1, p2, obstacle_bounds, all_obstacles_dict, verti
                     best_cost      = cost
                     best_waypoints = [v]
 
-    # ── Strategy 2: Z-elevator fly-over ───────────────────────────────────
+    # Strategy 2: Z-elevator fly-over (only if Strategy 1 finds no solution)
     if best_waypoints is None:
         max_peak = max(obs['z'] + obs['h'] / 2.0
                        for obs in all_obstacles_dict.values())
@@ -188,8 +228,14 @@ def calculate_shortest_detour(p1, p2, obstacle_bounds, all_obstacles_dict, verti
 
 def build_cost_matrix(scenario_data, vertical_penalty):
     """
-    Build N×N cost matrix using weighted_distance with the scene-chosen penalty.
-    Also returns waypoints_matrix: dict[(i,j)] → [via_point, ...]
+    Build the N x N cost matrix using weighted_distance with the
+    scene-adaptive vertical penalty selected by analyse_scene().
+
+    Index 0     = drone start position
+    Index 1..N-1 = viewpoints (sorted by key)
+
+    Also returns waypoints_matrix: dict[(i,j)] -> [via_point, ...]
+    containing the physical via-points to execute on edge (i->j).
     """
     points = []
     start  = scenario_data['drone_start_pose']
@@ -223,6 +269,7 @@ def build_cost_matrix(scenario_data, vertical_penalty):
                     cost_matrix[i][j]        = detour_cost
                     waypoints_matrix[(i, j)] = wp_list
                 else:
+                    # No valid detour found — heavy penalty so TSP avoids this edge
                     cost_matrix[i][j] = weighted_distance(p1, p2, vertical_penalty) * 100.0
             else:
                 cost_matrix[i][j] = weighted_distance(p1, p2, vertical_penalty)
@@ -232,7 +279,8 @@ def build_cost_matrix(scenario_data, vertical_penalty):
 
 def solve_tsp(matrix, solver_name):
     """
-    Dispatch to the solver chosen by analyse_scene().
+    Dispatch to the solver selected by analyse_scene().
+    SA inherits the fixed SA_MAX_TIME budget; see module header for limitations.
     """
     if solver_name == 'simulated_annealing':
         route, cost = solve_tsp_simulated_annealing(
@@ -244,46 +292,47 @@ def solve_tsp(matrix, solver_name):
 
 
 # ==========================================================================
-# 🚁  EXECUTION MODULE — drone control
+# EXECUTION MODULE — Drone Control
 # ==========================================================================
 
 def _exec_speed(from_pos, to_pos):
+    """
+    Select execution speed based on height difference of the current leg.
+    Vertical legs use reduced speed to counteract inertia-induced overshoot.
+    """
     if abs(float(to_pos[2]) - float(from_pos[2])) > VERTICAL_THRESHOLD:
         return SPEED_VERTICAL
     return SPEED_LATERAL
 
 
 def drone_start(drone_interface: DroneInterface) -> bool:
-    print('[LOG] 🛫  Arming and taking off...')
+    print('[LOG] Arming and taking off...')
     ok = drone_interface.arm()
     ok = ok and drone_interface.offboard()
     ok = ok and drone_interface.takeoff(height=TAKE_OFF_HEIGHT, speed=TAKE_OFF_SPEED)
-    print(f'[LOG] Take-off: {"✅ OK" if ok else "❌ FAILED"}')
+    print(f'[LOG] Take-off: {"OK" if ok else "FAILED"}')
     return ok
 
 
 def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) -> bool:
-    print('\n[LOG] ═══════════════════════════════════════════════════')
-    print('[LOG] 🔍  PHASE 0 — SCENE ANALYSIS')
-    print('[LOG] ═══════════════════════════════════════════════════')
+    print('\n[LOG] === PHASE 0: SCENE ANALYSIS ===')
 
-    # ── Build a temporary points array just for scene analysis ────────────
-    start  = scenario['drone_start_pose']
+    # Build temporary points array for scene analysis
+    start    = scenario['drone_start_pose']
     vp_poses = scenario['viewpoint_poses']
-    all_pts = [[start['x'], start['y'], start['z']]] + [
+    all_pts  = [[start['x'], start['y'], start['z']]] + [
         [vp['x'], vp['y'], vp['z']] for vp in vp_poses.values()
     ]
     pts_for_analysis = np.array(all_pts)
     obstacles_dict   = scenario.get('obstacles', {})
 
     solver_name, vertical_penalty = analyse_scene(pts_for_analysis, obstacles_dict)
-    metrics['solver_used']     = solver_name
+    metrics['solver_used']      = solver_name
     metrics['vertical_penalty'] = vertical_penalty
 
-    print('\n[LOG] ═══════════════════════════════════════════════════')
-    print('[LOG] 🧠  PHASE 1 — ADAPTIVE PATH PLANNING')
-    print('[LOG] ═══════════════════════════════════════════════════')
+    print('\n[LOG] === PHASE 1: ADAPTIVE PATH PLANNING ===')
 
+    # Build cost matrix with scene-adaptive penalty and solve TSP
     t0 = time.time()
     matrix, original_vp_ids, points_array, waypoints_matrix = build_cost_matrix(
         scenario, vertical_penalty
@@ -295,9 +344,7 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) ->
     print(f'[LOG] Best TSP cost : {best_cost:.2f}')
     print(f'[LOG] Route indices : {route_indices}')
 
-    print('\n[LOG] ═══════════════════════════════════════════════════')
-    print('[LOG] 🚁  PHASE 2 — TACTICAL EXECUTION')
-    print('[LOG] ═══════════════════════════════════════════════════')
+    print('\n[LOG] === PHASE 2: MISSION EXECUTION ===')
 
     planned_distance = 0.0
     optimized_vpids  = []
@@ -306,6 +353,7 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) ->
         idx_curr = route_indices[step]
         idx_next = route_indices[step + 1]
 
+        # Skip return-to-start edge (open-path mission)
         if idx_next == 0:
             continue
 
@@ -316,20 +364,20 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) ->
 
         current_pos = points_array[idx_curr]
 
-        # ── Intermediate via-points ────────────────────────────────────────
+        # Execute intermediate via-points (V-shape detour or Z-elevator) if present
         if (idx_curr, idx_next) in waypoints_matrix:
             for wp in waypoints_matrix[(idx_curr, idx_next)]:
                 wp_f = [float(wp[0]), float(wp[1]), float(wp[2])]
                 spd  = _exec_speed(current_pos, wp)
 
-                print(f'[LOG] ⚠️  Via-point [{wp_f[0]:.2f}, {wp_f[1]:.2f}, {wp_f[2]:.2f}]'
+                print(f'[LOG] Via-point [{wp_f[0]:.2f}, {wp_f[1]:.2f}, {wp_f[2]:.2f}]'
                       f'  speed={spd:.2f}')
 
                 ok = drone_interface.go_to.go_to_point_with_yaw(
                     wp_f, angle=float(vp['w']), speed=spd
                 )
                 if not ok:
-                    print(f'[ERROR] ❌ Failed at via-point for VP {vpid}')
+                    print(f'[ERROR] Failed at via-point for VP {vpid}')
                     return False
 
                 planned_distance += np.linalg.norm(current_pos - wp)
@@ -337,8 +385,8 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) ->
 
         planned_distance += np.linalg.norm(current_pos - points_array[idx_next])
 
-        # ── Final approach to viewpoint ────────────────────────────────────
-        print(f'[LOG] >>> VP {vpid}  '
+        # Final approach to viewpoint at full cruise speed
+        print(f'[LOG] Viewpoint {vpid}  '
               f'(x={vp["x"]:.2f}  y={vp["y"]:.2f}  z={vp["z"]:.2f}  yaw={vp["w"]:.2f})'
               f'  speed={SPEED_CRUISE:.2f}')
 
@@ -346,10 +394,10 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) ->
             goal, angle=float(vp['w']), speed=SPEED_CRUISE
         )
         if not ok:
-            print(f'[ERROR] ❌ Failed to reach Viewpoint {vpid}!')
+            print(f'[ERROR] Failed to reach Viewpoint {vpid}!')
             return False
 
-        print(f'[LOG] ✅  Reached VP {vpid}.')
+        print(f'[LOG] Reached Viewpoint {vpid}.')
         sleep(SLEEP_TIME)
 
     metrics['algo_time']        = algo_time
@@ -359,25 +407,27 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, metrics: dict) ->
 
 
 def drone_end(drone_interface: DroneInterface) -> bool:
-    print('\n[LOG] 🛬  Landing (NOT counted in mission time)...')
+    """Land and switch to manual mode. Called after the mission timer has stopped."""
+    print('\n[LOG] Landing sequence (excluded from net mission time)...')
     ok = drone_interface.land(speed=LAND_SPEED)
     ok = ok and drone_interface.manual()
-    print(f'[LOG] Land: {"✅ OK" if ok else "❌ FAILED"}')
+    print(f'[LOG] Land: {"OK" if ok else "FAILED"}')
     return ok
 
 
 def read_scenario(file_path: str) -> dict:
+    """Load scenario configuration from a YAML file."""
     with open(file_path, 'r') as f:
         return yaml.safe_load(f)
 
 
 # ==========================================================================
-# 📊  ENTRY POINT & POST-FLIGHT REPORT
+# ENTRY POINT & POST-FLIGHT REPORT
 # ==========================================================================
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Method 4 – Adaptive TSP (auto solver + auto vertical penalty)')
+        description='M4 — Scene-Adaptive Hybrid Strategy (auto solver + auto vertical penalty)')
     parser.add_argument('scenario',             type=str,            help='Path to scenario YAML')
     parser.add_argument('-n', '--namespace',    type=str, default='drone0')
     parser.add_argument('-v', '--verbose',      action='store_true', default=False)
@@ -385,11 +435,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print('=' * 56)
-    print('🚀  METHOD 4 — ADAPTIVE TSP')
+    print('METHOD 4 — SCENE-ADAPTIVE HYBRID STRATEGY')
     print(f'    Scenario      : {args.scenario}')
     print(f'    Drone ID      : {args.namespace}')
-    print(f'    SPEED         : {SPEED} m/s')
-    print(f'    SafetyMargin  : {SAFETY_MARGIN} m')
+    print(f'    Speed         : {SPEED} m/s')
+    print(f'    Safety Margin : {SAFETY_MARGIN} m')
     print(f'    (Solver and penalty auto-selected at runtime)')
     print('=' * 56)
 
@@ -420,7 +470,7 @@ if __name__ == '__main__':
             flight_ok = drone_run(uav, scenario, mission_metrics)
             mission_metrics['mission_success'] = flight_ok
 
-        # ══ STOP CLOCK — before landing ══
+        # Stop mission clock before landing
         mission_metrics['total_time'] = time.time() - t_mission_start
 
     except KeyboardInterrupt:
@@ -428,19 +478,21 @@ if __name__ == '__main__':
         print('\n[WARNING] Mission interrupted by user.')
 
     finally:
+        # Landing occurs after timing and does not affect the mission time metric
         drone_end(uav)
 
     uav.shutdown()
     rclpy.shutdown()
 
+    # Post-flight performance report
     print('\n' + '=' * 56)
-    print('📈  POST-FLIGHT REPORT  (METHOD 4 — ADAPTIVE)')
+    print('POST-FLIGHT REPORT — METHOD 4')
     print('=' * 56)
-    print(f"Strategy         : Adaptive (auto-configured at runtime)")
+    print(f"Strategy         : Scene-Adaptive (auto-configured at runtime)")
     print(f"Solver Used      : {mission_metrics['solver_used']}")
-    print(f"Vertical Penalty : {mission_metrics['vertical_penalty']}×")
+    print(f"Vertical Penalty : {mission_metrics['vertical_penalty']}x")
     print(f"Safety Margin    : {SAFETY_MARGIN} m")
-    print(f"Status           : {'✅ SUCCESS' if mission_metrics['mission_success'] else '❌ FAILED'}")
+    print(f"Status           : {'SUCCESS' if mission_metrics['mission_success'] else 'FAILED'}")
     print(f"Algorithm Time   : {mission_metrics['algo_time']:.4f} s")
     print(f"Net Mission Time : {mission_metrics['total_time']:.2f} s  (landing excluded)")
     print(f"Flight Distance  : {mission_metrics['planned_distance']:.2f} m  (true physical)")
